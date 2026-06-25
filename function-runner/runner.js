@@ -23,7 +23,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = 4000;
-const HANDLER_PATH = path.resolve(__dirname, "handler.js");
+const HANDLER_PATH = process.env.HANDLER_PATH || path.resolve(__dirname, "handler.js");
 
 // ─────────────────────────────────────────────
 // HEALTH CHECK

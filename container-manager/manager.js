@@ -13,12 +13,9 @@ const EXECUTION_TIMEOUT = parseInt(process.env.EXECUTION_TIMEOUT || "5000");
 // ─────────────────────────────────────────────
 // WARM CONTAINER POOL
 // functionName → { containerId, hostPort, lastUsed, handlerHash }
-// handlerHash lets us detect when a handler was re-registered so we
-// evict the old container and inject the new code fresh.
 // ─────────────────────────────────────────────
 const containerPool = new Map();
 
-// Simple hash so we can compare handler versions without storing the full code
 function hashCode(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) {
@@ -28,7 +25,24 @@ function hashCode(str) {
 }
 
 // ─────────────────────────────────────────────
-// INJECT HANDLER: write handler.js into running container via docker exec
+// HEALTH & READINESS ENDPOINTS
+// ─────────────────────────────────────────────
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+app.get("/ready", async (req, res) => {
+  try {
+    await docker.ping();
+    res.status(200).json({ status: "ok", docker: "connected" });
+  } catch (err) {
+    console.error("Docker ping failed:", err.message);
+    res.status(503).json({ status: "error", error: "Docker unreachable" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// INJECT HANDLER: write handler.js into /tmp/handler.js in container
 // ─────────────────────────────────────────────
 async function injectHandler(containerId, handlerCode) {
   const container = docker.getContainer(containerId);
@@ -40,7 +54,7 @@ async function injectHandler(containerId, handlerCode) {
     .replace(/\$/g, "\\$");
 
   const exec = await container.exec({
-    Cmd: ["node", "-e", `require('fs').writeFileSync('/app/handler.js', \`${escaped}\`)`],
+    Cmd: ["node", "-e", `require('fs').writeFileSync('/tmp/handler.js', \`${escaped}\`)`],
     AttachStdout: true,
     AttachStderr: true,
   });
@@ -48,18 +62,17 @@ async function injectHandler(containerId, handlerCode) {
   await new Promise((resolve, reject) => {
     exec.start({ hijack: true, stdin: false }, (err, stream) => {
       if (err) return reject(err);
-      // Drain stream to prevent backpressure; resolve on end
       stream.resume();
       stream.on("end", resolve);
       stream.on("error", reject);
     });
   });
 
-  console.log(`Handler injected into container ${containerId.slice(0, 12)}`);
+  console.log(`Handler injected into container ${containerId.slice(0, 12)} at /tmp/handler.js`);
 }
 
 // ─────────────────────────────────────────────
-// GET OR CREATE CONTAINER
+// GET OR CREATE CONTAINER (WITH RESOURCE LIMITS)
 // ─────────────────────────────────────────────
 async function getOrCreateContainer(functionName, image, handlerCode) {
   const newHash = hashCode(handlerCode);
@@ -71,13 +84,11 @@ async function getOrCreateContainer(functionName, image, handlerCode) {
       const state = await container.inspect();
 
       if (state.State.Running) {
-        // If handler was re-registered (different hash) — evict and cold start
         if (cached.handlerHash !== newHash) {
           console.log(`Handler changed for "${functionName}" — evicting warm container and re-injecting`);
           containerPool.delete(functionName);
           await container.stop().catch(() => {});
           await container.remove().catch(() => {});
-          // Fall through to cold start below
         } else {
           console.log(`Reusing warm container for function: ${functionName}`);
           cached.lastUsed = Date.now();
@@ -93,7 +104,7 @@ async function getOrCreateContainer(functionName, image, handlerCode) {
     }
   }
 
-  // ── Cold start ──
+  // ── Cold start with Sandboxed Limits ──
   console.log(`Cold start for function: "${functionName}" using image: ${image}`);
 
   const container = await docker.createContainer({
@@ -102,6 +113,13 @@ async function getOrCreateContainer(functionName, image, handlerCode) {
     HostConfig: {
       PortBindings: {
         "4000/tcp": [{ HostPort: "0" }] // dynamic host port
+      },
+      Memory: 128 * 1024 * 1024, // 128 MB RAM Limit
+      NanoCpus: 500000000,       // 0.5 CPU Limit
+      Privileged: false,         // Disable privileged mode
+      ReadonlyRootfs: true,      // Set root filesystem as read-only
+      Tmpfs: {
+        "/tmp": "rw,noexec,nosuid,size=65536k" // writable tmpfs for injected handler code
       }
     }
   });
@@ -130,7 +148,7 @@ async function getOrCreateContainer(functionName, image, handlerCode) {
     throw new Error(`Runner container for "${functionName}" failed health check`);
   }
 
-  // Inject the user's handler code into the freshly started container
+  // Inject the user's handler code into the /tmp/ directory
   await injectHandler(container.id, handlerCode);
 
   const entry = {
@@ -146,15 +164,15 @@ async function getOrCreateContainer(functionName, image, handlerCode) {
 }
 
 // ─────────────────────────────────────────────
-// IDLE CONTAINER TTL CLEANUP (every 60s)
+// IDLE CONTAINER TTL CLEANUP
 // ─────────────────────────────────────────────
 setInterval(async () => {
   const now = Date.now();
-  const idleTTL = 5 * 60 * 1000; // 5 minutes
+  const idleTTL = parseInt(process.env.IDLE_CONTAINER_TTL_MS || "300000"); // 5 minutes default
 
   for (const [fnName, cached] of containerPool.entries()) {
     if (now - cached.lastUsed > idleTTL) {
-      console.log(`Evicting idle container for "${fnName}" (idle > 5 min)`);
+      console.log(`Evicting idle container for "${fnName}" (idle > ${idleTTL}ms)`);
       containerPool.delete(fnName);
       try {
         const container = docker.getContainer(cached.containerId);
@@ -169,10 +187,6 @@ setInterval(async () => {
 
 // ─────────────────────────────────────────────
 // POST /execute
-// Body: { functionName, payload, handlerCode }
-//
-// Called by the Worker. Spins up (or reuses) a container,
-// injects handler.js, then POSTs payload to /run.
 // ─────────────────────────────────────────────
 app.post("/execute", async (req, res) => {
   const { functionName, payload, handlerCode } = req.body;
@@ -185,8 +199,6 @@ app.post("/execute", async (req, res) => {
   }
 
   try {
-    // Look up the image to use from registry (handler_code also returned but
-    // we already have it from the job payload — avoids a second DB round-trip)
     const registryRes = await axios.get(`${REGISTRY_URL}/function/${functionName}`);
     const { image } = registryRes.data;
 
@@ -212,9 +224,6 @@ app.post("/execute", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────
-// START SERVER
-// ─────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Container Manager running on port ${PORT}`);
 });

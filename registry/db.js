@@ -11,28 +11,29 @@ const pool = new Pool({
 // Initialize database tables on startup
 async function initDb() {
   try {
+    // 1. Create functions table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS functions (
         name         VARCHAR(255) PRIMARY KEY,
         owner        VARCHAR(255) NOT NULL,
         image        VARCHAR(255) NOT NULL DEFAULT 'function-runner:latest',
-        handler_code TEXT        NOT NULL DEFAULT '',
         created_at   TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
-    // Migrate existing tables: add handler_code column if it was created
-    // without it (safe to run repeatedly thanks to IF NOT EXISTS equivalent)
+    // 2. Create function_versions table
     await pool.query(`
-      ALTER TABLE functions
-        ADD COLUMN IF NOT EXISTS handler_code TEXT NOT NULL DEFAULT '';
+      CREATE TABLE IF NOT EXISTS function_versions (
+        id            SERIAL PRIMARY KEY,
+        function_name VARCHAR(255) NOT NULL REFERENCES functions(name) ON DELETE CASCADE,
+        version       INT NOT NULL,
+        handler_code  TEXT NOT NULL,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(function_name, version)
+      );
     `);
 
-    await pool.query(`
-      ALTER TABLE functions
-        ADD COLUMN IF NOT EXISTS image VARCHAR(255) NOT NULL DEFAULT 'function-runner:latest';
-    `).catch(() => {}); // ignore if column already exists
-
+    // 3. Create jobs table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS jobs (
         id            VARCHAR(255) PRIMARY KEY,
@@ -43,6 +44,17 @@ async function initDb() {
         created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
         updated_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    // 4. Alter jobs table to add audit and versioning columns if they don't exist
+    await pool.query(`
+      ALTER TABLE jobs
+        ADD COLUMN IF NOT EXISTS function_version_id INT REFERENCES function_versions(id),
+        ADD COLUMN IF NOT EXISTS attempt_count INT DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS started_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS duration_ms INT,
+        ADD COLUMN IF NOT EXISTS failure_reason TEXT;
     `);
 
     console.log("Database tables initialized successfully");

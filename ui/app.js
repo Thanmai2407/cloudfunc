@@ -2,8 +2,7 @@
    CloudFunc Dashboard — app.js
    ========================================== */
 
-const GATEWAY_URL  = 'http://localhost:5001';
-const REGISTRY_URL = 'http://localhost:8080';
+const GATEWAY_URL = 'http://localhost:5001';
 
 // ── Tracked jobs for live feed polling ────────
 const trackedJobs = new Map(); // jobId → { functionName, status }
@@ -62,6 +61,14 @@ module.exports = async (input) => {
 };
 
 // ── Helpers ────────────────────────────────────
+
+function getAuthHeaders() {
+  const token = document.getElementById('invokeToken').value.trim() || 'my-token';
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`
+  };
+}
 
 function showToast(message, type = 'info') {
   const c = document.getElementById('toastContainer');
@@ -128,12 +135,17 @@ Object.keys(TEMPLATES).forEach(id => {
 
 async function checkServices() {
   try {
-    await fetch(`${REGISTRY_URL}/functions`, { signal: AbortSignal.timeout(2500) });
-    statusDot.className = 'status-dot online';
-    statusText.textContent = 'All services reachable';
+    const res = await fetch(`${GATEWAY_URL}/ready`, { signal: AbortSignal.timeout(2500) });
+    if (res.ok) {
+      statusDot.className = 'status-dot online';
+      statusText.textContent = 'All services reachable';
+    } else {
+      statusDot.className = 'status-dot partial';
+      statusText.textContent = 'Service issues detected';
+    }
   } catch {
     statusDot.className = 'status-dot offline';
-    statusText.textContent = 'Services offline — start them first';
+    statusText.textContent = 'Gateway offline — start compose first';
   }
 }
 
@@ -141,7 +153,10 @@ async function checkServices() {
 
 async function refreshStats() {
   try {
-    const res = await fetch(`${REGISTRY_URL}/functions`);
+    const res = await fetch(`${GATEWAY_URL}/functions`, {
+      headers: getAuthHeaders()
+    });
+    if (!res.ok) throw new Error();
     const fns = await res.json();
     document.getElementById('fnCount').textContent = Array.isArray(fns) ? fns.length : '?';
   } catch {
@@ -163,11 +178,21 @@ async function refreshStats() {
 
 async function loadFunctions() {
   try {
-    const res = await fetch(`${REGISTRY_URL}/functions`);
+    const res = await fetch(`${GATEWAY_URL}/functions`, {
+      headers: getAuthHeaders()
+    });
+    if (!res.ok) {
+      if (res.status === 401) {
+        functionsBody.innerHTML = '<tr><td colspan="5" class="empty-state">Unauthorized. Enter valid Bearer token below.</td></tr>';
+      } else {
+        functionsBody.innerHTML = `<tr><td colspan="5" class="empty-state">Error: HTTP ${res.status}</td></tr>`;
+      }
+      return;
+    }
     const fns = await res.json();
 
     if (!Array.isArray(fns) || fns.length === 0) {
-      functionsBody.innerHTML = '<tr><td colspan="5" class="empty-state">No functions registered yet.</td></tr>';
+      functionsBody.innerHTML = '<tr><td colspan="5" class="empty-state">No functions registered yet for this user.</td></tr>';
       return;
     }
 
@@ -183,7 +208,7 @@ async function loadFunctions() {
       </tr>
     `).join('');
   } catch {
-    functionsBody.innerHTML = '<tr><td colspan="5" class="empty-state">Could not reach Registry. Start the services first.</td></tr>';
+    functionsBody.innerHTML = '<tr><td colspan="5" class="empty-state">Could not reach Gateway. Start the services first.</td></tr>';
   }
 }
 
@@ -201,12 +226,11 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
   e.preventDefault();
   const btn         = document.getElementById('registerBtn');
   const name        = document.getElementById('funcName').value.trim();
-  const owner       = document.getElementById('funcOwner').value.trim();
   const image       = document.getElementById('funcImage').value.trim() || 'function-runner:latest';
   const handler_code = document.getElementById('funcHandler').value.trim();
 
-  if (!name || !owner || !handler_code) {
-    showToast('Name, owner, and handler code are required', 'error');
+  if (!name || !handler_code) {
+    showToast('Name and handler code are required', 'error');
     return;
   }
 
@@ -214,10 +238,10 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
   hideResult('registerResult');
 
   try {
-    const res  = await fetch(`${REGISTRY_URL}/registerFunction`, {
+    const res  = await fetch(`${GATEWAY_URL}/registerFunction`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, owner, image, handler_code }),
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ name, image, handler_code }),
     });
     const data = await res.json();
 
@@ -231,8 +255,8 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
       showToast(data.error || 'Registration failed', 'error');
     }
   } catch (err) {
-    showResult('registerResult', `Error: ${err.message}\n\nMake sure the Registry is running:\n  node registry/registry.js`, 'error');
-    showToast('Could not reach Registry', 'error');
+    showResult('registerResult', `Error: ${err.message}\n\nMake sure the Gateway is running:\n  node gateway/gateway.js`, 'error');
+    showToast('Could not reach Gateway', 'error');
   } finally {
     setButtonLoading(btn, false);
   }
@@ -245,7 +269,6 @@ document.getElementById('invokeForm').addEventListener('submit', async (e) => {
   const btn          = document.getElementById('invokeBtn');
   const functionName = document.getElementById('invokeName').value.trim();
   const inputRaw     = document.getElementById('invokeInput').value.trim();
-  const token        = document.getElementById('invokeToken').value.trim() || 'my-token';
 
   if (!functionName) {
     showToast('Please enter a function name', 'error');
@@ -265,10 +288,7 @@ document.getElementById('invokeForm').addEventListener('submit', async (e) => {
   try {
     const res  = await fetch(`${GATEWAY_URL}/invoke`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
+      headers: getAuthHeaders(),
       body: JSON.stringify({ functionName, input }),
     });
     const data = await res.json();
@@ -377,7 +397,7 @@ function updateJobEl(jobId, data) {
         resultEl.textContent = JSON.stringify(parsed, null, 2);
       } else if (status === 'failed') {
         resultEl.className = 'job-result result-error';
-        resultEl.textContent = `Error: ${error || 'Execution failed after 3 retries'}`;
+        resultEl.textContent = `Error: ${error || 'Execution failed'}`;
       }
       const footer = el.querySelector('.job-footer');
       if (footer) el.insertBefore(resultEl, footer);
@@ -392,7 +412,9 @@ function updateJobEl(jobId, data) {
 // ── Polling ────────────────────────────────────
 
 async function fetchJobStatus(jobId) {
-  const res = await fetch(`${GATEWAY_URL}/jobs/${jobId}`);
+  const res = await fetch(`${GATEWAY_URL}/jobs/${jobId}`, {
+    headers: getAuthHeaders()
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }

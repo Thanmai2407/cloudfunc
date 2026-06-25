@@ -15,26 +15,33 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 // ─────────────────────────────────────────────
-// Auth Middleware
+// AUTHENTICATION MIDDLEWARE
+// Expects: Authorization: Bearer <username>-token
 // ─────────────────────────────────────────────
 function verifyAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader) {
-    console.warn("Warning: Missing Authorization header");
-  } else {
-    console.log("Authorization header verified:", authHeader);
+    return res.status(401).json({ error: "Unauthorized: Missing Authorization header" });
   }
+
+  const match = authHeader.match(/^Bearer\s+([a-zA-Z0-9_-]+)-token$/i);
+  if (!match) {
+    return res.status(401).json({ error: "Unauthorized: Invalid token format. Expected 'Bearer <username>-token'" });
+  }
+
+  req.owner = match[1];
   next();
 }
 
 let channel;
+let connection;
 
 // ─────────────────────────────────────────────
-// Connect to RabbitMQ (with auto-retry)
+// CONNECT TO RABBITMQ
 // ─────────────────────────────────────────────
 async function connectRabbitMQ() {
   try {
-    const connection = await amqp.connect(RABBITMQ_URL);
+    connection = await amqp.connect(RABBITMQ_URL);
     channel = await connection.createChannel();
     await channel.assertQueue(QUEUE_NAME, { durable: true });
     console.log("Gateway connected to RabbitMQ");
@@ -46,18 +53,73 @@ async function connectRabbitMQ() {
 
 connectRabbitMQ();
 
-/**
- * POST /invoke
- * Body: { functionName, input }
- *
- * 1. Looks up function metadata + handler_code from Registry
- * 2. Creates a job record (status: queued)
- * 3. Publishes job (including handler_code) to RabbitMQ
- * 4. Returns 202 + jobId immediately
- *
- * The handler_code travels with the job so the Worker → Container Manager
- * can inject it into the running container without an extra Registry call.
- */
+// ─────────────────────────────────────────────
+// HEALTH & READINESS ENDPOINTS
+// ─────────────────────────────────────────────
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+app.get("/ready", async (req, res) => {
+  try {
+    // 1. Check RabbitMQ connection
+    if (!connection || !channel) {
+      throw new Error("RabbitMQ connection or channel is not established");
+    }
+
+    // 2. Check Registry connection
+    const registryRes = await axios.get(`${REGISTRY_URL}/health`, { timeout: 2000 });
+    if (registryRes.status !== 200) {
+      throw new Error("Registry returned non-200 on health check");
+    }
+
+    res.status(200).json({ status: "ok", rabbitmq: "connected", registry: "connected" });
+  } catch (err) {
+    console.error("Gateway readiness check failed:", err.message);
+    res.status(503).json({ status: "error", error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// PROXIED REGISTRATION ENDPOINT (AUTHENTICATED)
+// ─────────────────────────────────────────────
+app.post("/registerFunction", verifyAuth, async (req, res) => {
+  const { name, handler_code, image } = req.body;
+
+  try {
+    // Forward to Registry injecting the authenticated owner
+    const registryRes = await axios.post(`${REGISTRY_URL}/registerFunction`, {
+      name,
+      owner: req.owner,
+      handler_code,
+      image,
+    });
+    res.status(registryRes.status).json(registryRes.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data || { error: "Failed to forward registration" };
+    res.status(status).json(data);
+  }
+});
+
+// ─────────────────────────────────────────────
+// PROXIED FUNCTIONS LIST ENDPOINT (OWNER ISOLATION)
+// ─────────────────────────────────────────────
+app.get("/functions", verifyAuth, async (req, res) => {
+  try {
+    // Only fetch functions belonging to the authenticated user
+    const registryRes = await axios.get(`${REGISTRY_URL}/functions?owner=${req.owner}`);
+    res.status(registryRes.status).json(registryRes.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data || { error: "Failed to fetch functions" };
+    res.status(status).json(data);
+  }
+});
+
+// ─────────────────────────────────────────────
+// SECURED INVOCATION ENDPOINT
+// ─────────────────────────────────────────────
 app.post("/invoke", verifyAuth, async (req, res) => {
   const { functionName, input } = req.body;
 
@@ -66,25 +128,29 @@ app.post("/invoke", verifyAuth, async (req, res) => {
   }
 
   try {
-    // 1. Verify function exists in registry and grab handler_code
+    // 1. Fetch function details from Registry
     const registryRes = await axios.get(`${REGISTRY_URL}/function/${functionName}`);
-    const { image, handler_code } = registryRes.data;
+    const { owner } = registryRes.data;
 
-    // 2. Generate unique jobId
+    // 2. Prevent users from executing other users' functions
+    if (owner !== req.owner) {
+      return res.status(403).json({ error: "Forbidden: You do not own this function" });
+    }
+
+    // 3. Generate unique jobId
     const jobId = uuidv4();
 
-    // 3. Create job record in DB
+    // 4. Create job record in DB
     await axios.post(`${REGISTRY_URL}/jobs`, {
       id: jobId,
       functionName,
     });
 
-    // 4. Publish job payload to RabbitMQ — handler_code rides along
+    // 5. Publish minimal job payload to RabbitMQ (avoid raw code passing)
     const jobPayload = {
       jobId,
       functionName,
       payload: input || {},
-      handlerCode: handler_code,   // ← user's handler injected at runtime
     };
 
     if (!channel) {
@@ -97,9 +163,9 @@ app.post("/invoke", verifyAuth, async (req, res) => {
       { persistent: true }
     );
 
-    console.log(`Job ${jobId} queued for function "${functionName}"`);
+    console.log(`Job ${jobId} queued for function "${functionName}" by user "${req.owner}"`);
 
-    // 5. Return 202 Accepted
+    // 6. Return 202 Accepted
     res.status(202).json({ jobId, status: "queued" });
 
   } catch (err) {
@@ -111,16 +177,27 @@ app.post("/invoke", verifyAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /jobs/:id
- * Fetches job status from Registry
- */
-app.get("/jobs/:id", async (req, res) => {
+// ─────────────────────────────────────────────
+// SECURED JOB STATUS ENDPOINT
+// ─────────────────────────────────────────────
+app.get("/jobs/:id", verifyAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
+    // Query job details from registry
     const registryRes = await axios.get(`${REGISTRY_URL}/jobs/${id}`);
-    res.json(registryRes.data);
+    const job = registryRes.data;
+
+    // Prevent users from reading other users' jobs
+    if (job.owner !== req.owner) {
+      return res.status(403).json({ error: "Forbidden: You do not own this job" });
+    }
+
+    // Clean up internal details (like handler_code) before responding to client
+    const clientResponse = { ...job };
+    delete clientResponse.handler_code;
+
+    res.json(clientResponse);
   } catch (err) {
     if (err.response?.status === 404) {
       return res.status(404).json({ error: "Job not found" });

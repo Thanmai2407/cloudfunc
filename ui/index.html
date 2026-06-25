@@ -63,17 +63,12 @@
               <input id="funcName" type="text" placeholder="e.g. greet" autocomplete="off" />
             </div>
             <div class="input-field">
-              <label for="funcOwner">Owner</label>
-              <input id="funcOwner" type="text" placeholder="alice" autocomplete="off" />
+              <label for="funcImage">
+                Docker Image
+                <span class="label-hint">optional</span>
+              </label>
+              <input id="funcImage" type="text" placeholder="function-runner:latest" autocomplete="off" />
             </div>
-          </div>
-
-          <div class="input-field">
-            <label for="funcImage">
-              Docker Image
-              <span class="label-hint">optional — defaults to function-runner:latest</span>
-            </label>
-            <input id="funcImage" type="text" placeholder="function-runner:latest" autocomplete="off" />
           </div>
 
           <!-- Handler Code editor -->

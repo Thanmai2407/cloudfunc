@@ -93,7 +93,7 @@ cloudfunc/
 └── README.md
 ```
 
-> All commands below should be run from inside the `phase3/` directory.
+> All commands below should be run from inside the `cloudfunc/` directory.
 
 ---
 
@@ -128,6 +128,7 @@ docker start cloudfunc-postgres cloudfunc-rabbitmq
 
 ---
 
+
 ## Step 2: Build the Function Runner Image
 
 ```bash
@@ -151,7 +152,7 @@ npm install   # For integration tests
 
 ## Step 4: Start All Services
 
-Open **4 separate terminal windows/tabs** inside `phase3/`:
+Open **4 separate terminal windows/tabs** inside `cloudfunc/`:
 
 **Terminal 1 — Registry**
 ```bash
@@ -249,8 +250,8 @@ node test.js
 
 ## Accessing the Dashboard UI
 
-Simply open [ui/index.html](file:///Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/phase3/ui/index.html) directly in any modern web browser:
+Simply open [ui/index.html](file:///Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/cloudfunc/ui/index.html) directly in any modern web browser:
 ```
-file:///Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/phase3/ui/index.html
+file:///Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/cloudfunc/ui/index.html
 ```
 The dashboard provides template pills (Math, Greet, Fetch, Timeout) for quickly loading and registering custom handler scripts.
