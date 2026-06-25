@@ -168,7 +168,7 @@ app.get("/function/:name", async (req, res) => {
 // CREATE JOB (QUEUED)
 // ─────────────────────────────────────────────
 app.post("/jobs", async (req, res) => {
-  const { id, functionName } = req.body;
+  const { id, functionName, input } = req.body;
 
   if (!id || !functionName) {
     return res.status(400).json({ error: "id and functionName are required" });
@@ -187,10 +187,10 @@ app.post("/jobs", async (req, res) => {
     const versionId = versionRes.rows[0].id;
 
     const result = await pool.query(
-      `INSERT INTO jobs (id, function_name, function_version_id, status)
-       VALUES ($1, $2, $3, 'queued')
+      `INSERT INTO jobs (id, function_name, function_version_id, input_payload, status)
+       VALUES ($1, $2, $3, $4, 'queued')
        RETURNING *`,
-      [id, functionName, versionId]
+      [id, functionName, versionId, input ? JSON.stringify(input) : null]
     );
 
     res.status(201).json(result.rows[0]);
@@ -312,6 +312,72 @@ app.get("/jobs/:id", async (req, res) => {
   } catch (err) {
     console.error("Failed to retrieve job details:", err.message);
     res.status(500).json({ error: "Failed to fetch job" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// STORE DLQ FAILURE DETAILS
+// ─────────────────────────────────────────────
+app.post("/failed-jobs", async (req, res) => {
+  const { jobId, functionName, payload, error, failedAt } = req.body;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO failed_jobs (job_id, function_name, payload, error, failed_at, dlq_message)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [
+        jobId || null,
+        functionName || null,
+        payload ? JSON.stringify(payload) : null,
+        error || null,
+        failedAt ? new Date(failedAt) : null,
+        JSON.stringify(req.body)
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Failed to store DLQ failure details:", err.message);
+    res.status(500).json({ error: "Failed to store failed job details" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// SEARCH DLQ FAILURE DETAILS
+// ─────────────────────────────────────────────
+app.get("/failed-jobs", async (req, res) => {
+  const { jobId, functionName, limit = "50" } = req.query;
+  const params = [];
+  const conditions = [];
+
+  if (jobId) {
+    params.push(jobId);
+    conditions.push(`job_id = $${params.length}`);
+  }
+
+  if (functionName) {
+    params.push(functionName);
+    conditions.push(`function_name = $${params.length}`);
+  }
+
+  const maxRows = Math.min(parseInt(limit, 10) || 50, 200);
+  params.push(maxRows);
+
+  try {
+    const result = await pool.query(
+      `SELECT *
+       FROM failed_jobs
+       ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+       ORDER BY created_at DESC
+       LIMIT $${params.length}`,
+      params
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Failed to search failed jobs:", err.message);
+    res.status(500).json({ error: "Failed to search failed jobs" });
   }
 });
 

@@ -78,6 +78,9 @@ services:
       REGISTRY_URL: http://registry:8080
       PORT: 3000
       EXECUTION_TIMEOUT: 5000
+      RUNNER_HOST: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       registry:
         condition: service_started
@@ -101,6 +104,24 @@ services:
       registry:
         condition: service_started
       container-manager:
+        condition: service_started
+    networks:
+      - cloudfunc-network
+
+  dlq-consumer:
+    build: ./Worker/worker
+    container_name: cloudfunc-dlq-consumer
+    ports:
+      - "5003:5003"
+    command: ["node", "dlq-consumer.js"]
+    environment:
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      REGISTRY_URL: http://registry:8080
+      DLQ_PORT: 5003
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      registry:
         condition: service_started
     networks:
       - cloudfunc-network

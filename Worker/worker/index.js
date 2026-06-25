@@ -39,7 +39,7 @@ app.listen(WORKER_PORT, () => {
 // JOB PROCESSING
 // ─────────────────────────────────────────────
 async function processJob(job) {
-  const { jobId, functionName, payload } = job;
+  const { jobId, functionName } = job;
 
   // 1. Update job → running (triggers attempt_count increment & started_at in registry)
   await axios.patch(`${REGISTRY_URL}/jobs/${jobId}`, {
@@ -48,7 +48,8 @@ async function processJob(job) {
 
   // 2. Fetch the pinned handler_code and version for this job dynamically from Registry
   const jobDetailsRes = await axios.get(`${REGISTRY_URL}/jobs/${jobId}`);
-  const { handler_code, version } = jobDetailsRes.data;
+  const { handler_code, version, function_version_id, input_payload } = jobDetailsRes.data;
+  const executionPayload = job.payload ?? input_payload ?? {};
 
   if (!handler_code) {
     throw new Error(`Handler code not found for job ${jobId}`);
@@ -59,8 +60,9 @@ async function processJob(job) {
   const response = await axios.post(`${CONTAINER_URL}/execute`, {
     jobId,
     functionName,
-    payload,
+    payload: executionPayload,
     handlerCode: handler_code,
+    versionId: function_version_id,
   });
 
   const result = response.data;
@@ -75,6 +77,18 @@ async function processJob(job) {
     status: "completed",
     result: result.result,
   });
+}
+
+async function getPayloadForDlq(job) {
+  if (job.payload !== undefined) return job.payload;
+
+  try {
+    const jobDetailsRes = await axios.get(`${REGISTRY_URL}/jobs/${job.jobId}`);
+    return jobDetailsRes.data.input_payload ?? {};
+  } catch (err) {
+    console.error(`Failed to fetch payload for DLQ job ${job.jobId}:`, err.message);
+    return {};
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -105,7 +119,7 @@ async function executeWithRetry(job, channel) {
           const dlqPayload = {
             jobId: job.jobId,
             functionName: job.functionName,
-            payload: job.payload,
+            payload: await getPayloadForDlq(job),
             error: errMsg,
             failedAt: new Date().toISOString(),
           };

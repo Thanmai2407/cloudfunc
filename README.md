@@ -1,143 +1,301 @@
-# ☁️ CloudFunc — Async Serverless Execution Platform (Phase 3)
+# CloudFunc - Async Serverless Execution Platform
 
-CloudFunc is a developer-centric **FaaS (Function-as-a-Service)** platform. In Phase 3, it allows users to register custom functions with their own **JavaScript handler code**. Invocations are queued asynchronously via RabbitMQ, processed by workers, executed in isolated Docker containers, and updated dynamically.
+CloudFunc is a local Function-as-a-Service platform. Users register JavaScript handler code, invoke functions asynchronously, and poll job results. The platform stores function versions and jobs in PostgreSQL, queues executions in RabbitMQ, and runs user code inside isolated Docker runner containers.
 
----
+## Architecture
 
-## Architecture Overview
-
-```
-Client / UI
-  │
-  ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                         GATEWAY  (:5001)                         │
-│   • Validates request + auth                                     │
-│   • Looks up function metadata + handler_code in Registry        │
-│   • Creates job (status: queued)                                 │
-│   • Publishes job with handler_code to RabbitMQ                  │
-│   • Returns 202 Accepted + jobId immediately                     │
-└──────────────────────────┬───────────────────────────────────────┘
-                           │ publish
-                           ▼
-                   ┌──────────────┐
-                   │   RabbitMQ   │   executions queue
-                   └───────┬──────┘
-                           │ consume
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   WORKER  (3 concurrent)                         │
-│   • Picks job from queue                                         │
-│   • Updates job → running                                        │
-│   • Passes payload and handler_code to Container Manager         │
-│   • Retries on failure (3x, exponential backoff)                 │
-│   • Updates job → completed / failed                             │
-└──────────────────────────┬───────────────────────────────────────┘
-                           │ POST /run
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│               CONTAINER MANAGER  (:3000)                         │
-│   • Checks warm container pool for function                      │
-│   • Evicts warm container if handler code hash changed           │
-│   • Cold start: docker run <image>, health-check                 │
-│   • Injects handler.js dynamically via `docker exec`             │
-│   • Forwards payload → Function Runner with timeout              │
-│   • Idle TTL: cleans up containers idle > 5 min                  │
-└──────────────────────────┬───────────────────────────────────────┘
-                           │ POST /run
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│        FUNCTION RUNNER  (Docker container, Port 4000)            │
-│   • Generic Node.js HTTP server inside Docker                    │
-│   • GET /health  — health check                                  │
-│   • POST /run    — dynamically executes require('./handler.js')  │
-└──────────────────────────────────────────────────────────────────┘
-                           │ result
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│              REGISTRY / DATABASE  (:8080 + PostgreSQL)           │
-│   • Stores function name, owner, image, and handler_code         │
-│   • Stores job records (id, status, result, error, timestamps)   │
-└──────────────────────────────────────────────────────────────────┘
+```text
+UI / curl
+  -> Gateway (:5001)
+  -> Registry (:8080) + PostgreSQL (:5433)
+  -> RabbitMQ (:5672)
+  -> Worker (:5002 health API)
+  -> Container Manager (:3000)
+  -> Function Runner containers (:4000 inside each dynamic container)
+  -> DLQ Consumer (:5003 health API)
 ```
 
----
+The important runtime flow is:
 
-## Project Structure
-
-```
-cloudfunc/
-├── gateway/
-│   ├── gateway.js        # API Gateway: ingests requests, queries Registry, queues jobs
-│   └── package.json
-├── registry/
-│   ├── registry.js       # Registry API: stores function schema, handler code, job statuses
-│   ├── db.js             # PostgreSQL pool + auto schema initialization
-│   └── package.json
-├── container-manager/
-│   ├── manager.js        # Container pool manager, cold/warm start, exec injection, eviction
-│   └── package.json
-├── function-runner/
-│   ├── runner.js         # Generic function runtime: requires handler.js on POST /run
-│   ├── Dockerfile        # Exposes port 4000 (NO hardcoded handlers inside)
-│   └── package.json
-├── Worker/
-│   └── worker/
-│       ├── index.js      # RabbitMQ consumer, calls Container Manager, manages DB state
-│       └── package.json
-├── ui/
-│   ├── index.html        # Modern dashboard with code editor, template pills & live feed
-│   ├── style.css         # Premium aesthetics, animations, responsive layout
-│   └── app.js            # Front-end logic, service checking, quick templates, polling
-├── test.js               # End-to-end integration tests (warm, cold, eviction, timeouts)
-└── README.md
+```text
+1. Client registers a function through Gateway.
+2. Gateway authenticates the user and forwards registration to Registry.
+3. Registry stores function metadata and creates a new function version.
+4. Client invokes a function through Gateway.
+5. Gateway creates a job in Registry and stores the input payload there.
+6. Gateway publishes only lightweight job metadata to RabbitMQ.
+7. Worker consumes the job, fetches the pinned function version and input payload from Registry, then calls Container Manager.
+8. Container Manager starts or reuses a version-aware warm Docker container, injects handler code, and calls the Function Runner.
+9. Worker updates the job as completed or failed.
+10. Permanently failed jobs are sent to `executions_dlq`; DLQ Consumer stores them in Registry's `failed_jobs` table for search.
 ```
 
-> All commands below should be run from inside the `cloudfunc/` directory.
+## Services
 
----
+| Service | Port | Purpose |
+|---|---:|---|
+| Gateway | 5001 | Public API, auth, ownership checks, job enqueueing |
+| Registry | 8080 | Function metadata, versions, jobs, failed-job records |
+| PostgreSQL | 5433 | Durable database |
+| RabbitMQ | 5672 | Execution queue |
+| RabbitMQ UI | 15672 | Queue management UI |
+| Container Manager | 3000 | Docker lifecycle, warm pool, code injection |
+| Worker | 5002 | Background job consumer health API |
+| DLQ Consumer | 5003 | Failed-job queue consumer health API |
 
 ## Prerequisites
 
-| Requirement | Notes |
-|---|---|
-| Node.js >= 18 | |
-| Docker Desktop | Must be running |
-| PostgreSQL 16 | Running on port `5433` |
-| RabbitMQ 3 | Running on port `5672` (and management UI on `15672`) |
+- Docker Desktop running
+- Node.js 18+ if you want to run tests or services manually
+- `jq` is optional but useful for formatting curl output
 
----
-
-## Step 1: Start Infrastructure (Docker)
+All commands below assume you are in the project root:
 
 ```bash
-docker start cloudfunc-postgres cloudfunc-rabbitmq
+cd /Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/cloudfunc
 ```
 
-> **First time setup?** Create the containers:
-> ```bash
-> docker run -d --name cloudfunc-postgres \
->   -e POSTGRES_USER=postgres \
->   -e POSTGRES_PASSWORD=postgres \
->   -e POSTGRES_DB=cloudfunc \
->   -p 5433:5432 postgres:16
->
-> docker run -d --name cloudfunc-rabbitmq \
->   -p 5672:5672 -p 15672:15672 rabbitmq:3-management
-> ```
+## Recommended Startup: Docker Compose
 
----
+Docker Compose starts the platform services together: PostgreSQL, RabbitMQ, Registry, Gateway, Container Manager, Worker, and DLQ Consumer.
 
+The Function Runner image is different: it is not a long-running Compose service. Container Manager creates Function Runner containers dynamically when jobs execute, so the Docker daemon must already have the `function-runner:latest` image.
 
-## Step 2: Build the Function Runner Image
+### 1. Build the Function Runner image
 
 ```bash
-docker build -t function-runner:latest function-runner/
+docker build -t function-runner:latest ./function-runner
 ```
 
----
+### 2. Start the platform
 
-## Step 3: Install Dependencies
+Foreground mode:
+
+```bash
+docker compose up --build
+```
+
+Detached mode:
+
+```bash
+docker compose up --build -d
+```
+
+### 3. Check service readiness
+
+```bash
+curl -s http://localhost:5001/ready | jq
+curl -s http://localhost:8080/ready | jq
+curl -s http://localhost:3000/ready | jq
+curl -s http://localhost:5002/ready | jq
+curl -s http://localhost:5003/ready | jq
+```
+
+RabbitMQ management UI:
+
+```text
+http://localhost:15672
+```
+
+Default RabbitMQ login:
+
+```text
+guest / guest
+```
+
+### 4. Open the UI
+
+The UI is still compatible with the current project. It now talks only to Gateway at:
+
+```text
+http://localhost:5001
+```
+
+Open this file in your browser:
+
+```text
+/Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/cloudfunc/ui/index.html
+```
+
+The default UI token is:
+
+```text
+my-token
+```
+
+That means Gateway treats the owner as:
+
+```text
+my
+```
+
+You can also use tokens like:
+
+```text
+alice-token
+bob-token
+```
+
+## Test With curl
+
+The Gateway auth format is:
+
+```text
+Authorization: Bearer <username>-token
+```
+
+For example, `Bearer alice-token` means the owner is `alice`.
+
+### Register a function
+
+```bash
+curl -s -X POST http://localhost:5001/registerFunction \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer alice-token" \
+  -d '{
+    "name": "add",
+    "image": "function-runner:latest",
+    "handler_code": "module.exports = async (input) => { const { a = 0, b = 0 } = input; return a + b; };"
+  }' | jq
+```
+
+### List your functions
+
+```bash
+curl -s http://localhost:5001/functions \
+  -H "Authorization: Bearer alice-token" | jq
+```
+
+### Invoke a function
+
+```bash
+curl -s -X POST http://localhost:5001/invoke \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer alice-token" \
+  -d '{
+    "functionName": "add",
+    "input": { "a": 15, "b": 35 }
+  }' | jq
+```
+
+You should receive:
+
+```json
+{
+  "jobId": "...",
+  "status": "queued"
+}
+```
+
+### Poll the job
+
+Replace `JOB_ID_HERE` with the returned job ID:
+
+```bash
+curl -s http://localhost:5001/jobs/JOB_ID_HERE \
+  -H "Authorization: Bearer alice-token" | jq
+```
+
+Successful result example:
+
+```json
+{
+  "id": "...",
+  "function_name": "add",
+  "status": "completed",
+  "result": 50,
+  "error": null
+}
+```
+
+## Failed Job Search
+
+If a job fails after all retries, Worker publishes it to:
+
+```text
+executions_dlq
+```
+
+DLQ Consumer stores those messages in Registry's `failed_jobs` table.
+
+Search failed jobs:
+
+```bash
+curl -s "http://localhost:8080/failed-jobs?functionName=add" | jq
+```
+
+Or by job ID:
+
+```bash
+curl -s "http://localhost:8080/failed-jobs?jobId=JOB_ID_HERE" | jq
+```
+
+## What Docker Compose Is For
+
+`docker-compose.yml` defines the local multi-service environment. Instead of opening separate terminals for PostgreSQL, RabbitMQ, Registry, Gateway, Container Manager, Worker, and DLQ Consumer, Compose builds and starts them as one connected system.
+
+Compose handles:
+
+- Starting PostgreSQL and RabbitMQ
+- Building service images from their Dockerfiles
+- Wiring service URLs like `http://registry:8080`
+- Exposing useful localhost ports
+- Mounting the Docker socket into Container Manager so it can create Function Runner containers
+- Setting `RUNNER_HOST=host.docker.internal` so Container Manager can call dynamically-created runner containers from inside Docker
+
+Compose does not replace the Function Runner image build. You still need:
+
+```bash
+docker build -t function-runner:latest ./function-runner
+```
+
+because Function Runner containers are created dynamically at execution time.
+
+## Useful Docker Commands
+
+Show running services:
+
+```bash
+docker compose ps
+```
+
+View logs:
+
+```bash
+docker compose logs -f
+```
+
+View one service's logs:
+
+```bash
+docker compose logs -f gateway
+docker compose logs -f worker
+docker compose logs -f container-manager
+```
+
+Stop services:
+
+```bash
+docker compose down
+```
+
+Stop services and remove database state:
+
+```bash
+docker compose down -v
+```
+
+Rebuild after code changes:
+
+```bash
+docker compose up --build
+```
+
+## Optional: Run Services Manually
+
+Manual mode is useful for debugging, but Compose is easier.
+
+Start PostgreSQL and RabbitMQ yourself, then install dependencies:
 
 ```bash
 npm install --prefix registry
@@ -145,113 +303,33 @@ npm install --prefix gateway
 npm install --prefix container-manager
 npm install --prefix function-runner
 npm install --prefix Worker/worker
-npm install   # For integration tests
+npm install
 ```
 
----
+Build the runner image:
 
-## Step 4: Start All Services
+```bash
+docker build -t function-runner:latest ./function-runner
+```
 
-Open **4 separate terminal windows/tabs** inside `cloudfunc/`:
+Start services in separate terminals:
 
-**Terminal 1 — Registry**
 ```bash
 node registry/registry.js
-```
-
-**Terminal 2 — Gateway**
-```bash
 node gateway/gateway.js
-```
-
-**Terminal 3 — Container Manager**
-```bash
 node container-manager/manager.js
-```
-
-**Terminal 4 — Worker**
-```bash
 node Worker/worker/index.js
+node Worker/worker/dlq-consumer.js
 ```
 
----
+In manual mode, the default service URLs use `localhost`, so no extra environment variables are usually needed.
 
-## Step 5: Register a Function (cURL Example)
+## Integration Test
 
-Submit function details along with your custom JavaScript `handler_code`:
+The integration test starts services locally with Node and expects PostgreSQL, RabbitMQ, Docker, and the `function-runner:latest` image to be available.
 
 ```bash
-curl -s -X POST http://localhost:8080/registerFunction \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "add",
-    "owner": "alice",
-    "image": "function-runner:latest",
-    "handler_code": "module.exports = async (input) => { const { a = 0, b = 0 } = input; return { result: a + b }; };"
-  }' | jq
+npm test
 ```
 
----
-
-## Step 6: Invoke a Function (cURL Example)
-
-Invocations are asynchronous; the API Gateway returns a `jobId` immediately:
-
-```bash
-curl -s -X POST http://localhost:5001/invoke \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer my-token" \
-  -d '{
-    "functionName": "add",
-    "input": { "a": 15, "b": 35 }
-  }' | jq
-```
-
-**Response (202 Accepted):**
-```json
-{
-  "jobId": "f8f23cd9-3e86-4bc0-a936-8acc8f05a36a",
-  "status": "queued"
-}
-```
-
----
-
-## Step 7: Poll for Job Status & Result
-
-```bash
-curl -s http://localhost:5001/jobs/f8f23cd9-3e86-4bc0-a936-8acc8f05a36a | jq
-```
-
-**On Success:**
-```json
-{
-  "id": "f8f23cd9-3e86-4bc0-a936-8acc8f05a36a",
-  "function_name": "add",
-  "status": "completed",
-  "result": {
-    "result": 50
-  },
-  "error": null
-}
-```
-
----
-
-## Running the Automated Integration Test
-
-To verify the cold starts, warm starts, handler updates (container eviction), and timeout retries:
-
-```bash
-node test.js
-```
-
----
-
-## Accessing the Dashboard UI
-
-Simply open [ui/index.html](file:///Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/cloudfunc/ui/index.html) directly in any modern web browser:
-```
-file:///Users/bhavyathota/PROJECTS/MY_CLOUDFUNC/cloudfunc/ui/index.html
-```
-The dashboard provides template pills (Math, Greet, Fetch, Timeout) for quickly loading and registering custom handler scripts.
+If Docker or infrastructure is not running, the integration test will fail.

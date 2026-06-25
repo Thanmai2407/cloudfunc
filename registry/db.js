@@ -50,11 +50,26 @@ async function initDb() {
     await pool.query(`
       ALTER TABLE jobs
         ADD COLUMN IF NOT EXISTS function_version_id INT REFERENCES function_versions(id),
+        ADD COLUMN IF NOT EXISTS input_payload JSONB,
         ADD COLUMN IF NOT EXISTS attempt_count INT DEFAULT 0,
         ADD COLUMN IF NOT EXISTS started_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS duration_ms INT,
         ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+    `);
+
+    // 5. Store failed queue messages consumed from the DLQ for later search/debugging
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS failed_jobs (
+        id            SERIAL PRIMARY KEY,
+        job_id        VARCHAR(255),
+        function_name VARCHAR(255),
+        payload       JSONB,
+        error         TEXT,
+        failed_at     TIMESTAMP,
+        dlq_message   JSONB NOT NULL,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
     `);
 
     console.log("Database tables initialized successfully");

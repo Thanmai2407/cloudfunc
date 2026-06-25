@@ -14,6 +14,9 @@ const QUEUE_NAME = "executions";
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+
+
+
 // ─────────────────────────────────────────────
 // AUTHENTICATION MIDDLEWARE
 // Expects: Authorization: Bearer <username>-token
@@ -144,13 +147,14 @@ app.post("/invoke", verifyAuth, async (req, res) => {
     await axios.post(`${REGISTRY_URL}/jobs`, {
       id: jobId,
       functionName,
+      input: input || {},
     });
 
-    // 5. Publish minimal job payload to RabbitMQ (avoid raw code passing)
+    // 5. Publish minimal job payload to RabbitMQ. Registry stores the input
+    // payload and pinned version, so the queue only carries a reference.
     const jobPayload = {
       jobId,
       functionName,
-      payload: input || {},
     };
 
     if (!channel) {
@@ -196,6 +200,7 @@ app.get("/jobs/:id", verifyAuth, async (req, res) => {
     // Clean up internal details (like handler_code) before responding to client
     const clientResponse = { ...job };
     delete clientResponse.handler_code;
+    delete clientResponse.input_payload;
 
     res.json(clientResponse);
   } catch (err) {
